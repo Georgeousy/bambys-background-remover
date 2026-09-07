@@ -1,6 +1,7 @@
 import io
 import os
 import gc
+import threading
 
 # Keep native numerical libraries conservative on Render's 512 MB free instance.
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -27,18 +28,28 @@ app.add_middleware(
 
 MODEL_NAME = os.getenv("REMBG_MODEL", "u2netp")
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
-
-# Keep the final Bamby detail image high quality while reducing the amount of
-# pixel data that the AI model must process.
 AI_MAX_SIDE = 960
 OUTPUT_SIZE = (1600, 2000)
 MARGIN = 80
 
-# One shared session avoids loading the model again for every request.
-SESSION = new_session(
-    MODEL_NAME,
-    providers=["CPUExecutionProvider"],
-)
+# IMPORTANT:
+# Do NOT create the rembg/ONNX session while the web server is starting.
+# Render needs the web port to open quickly. We create the model lazily on the
+# first /remove request instead.
+SESSION = None
+SESSION_LOCK = threading.Lock()
+
+
+def get_session():
+    global SESSION
+    if SESSION is None:
+        with SESSION_LOCK:
+            if SESSION is None:
+                SESSION = new_session(
+                    MODEL_NAME,
+                    providers=["CPUExecutionProvider"],
+                )
+    return SESSION
 
 
 @app.get("/")
@@ -47,13 +58,18 @@ def root():
         "ok": True,
         "service": "Bamby's Background Remover",
         "model": MODEL_NAME,
-        "mode": "low-memory",
+        "mode": "lazy-low-memory",
     }
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": MODEL_NAME, "mode": "low-memory"}
+    return {
+        "ok": True,
+        "model": MODEL_NAME,
+        "mode": "lazy-low-memory",
+        "model_loaded": SESSION is not None,
+    }
 
 
 @app.post("/remove")
@@ -73,13 +89,15 @@ async def remove_background(image: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="The uploaded file is not a valid image.")
 
     try:
-        # Downscale only the AI working copy. This is the main RAM-saving step.
         working = original.copy()
         working.thumbnail((AI_MAX_SIDE, AI_MAX_SIDE), Image.Resampling.LANCZOS)
 
+        # Load the AI model only when background removal is actually requested.
+        session = get_session()
+
         foreground = remove(
             working,
-            session=SESSION,
+            session=session,
             alpha_matting=False,
             post_process_mask=False,
         )
@@ -89,12 +107,10 @@ async def remove_background(image: UploadFile = File(...)):
         else:
             foreground = foreground.convert("RGBA")
 
-        # Free the largest no-longer-needed objects before composing the output.
         original.close()
         del original, working, raw
         gc.collect()
 
-        # Preserve the entire subject and place it on Bamby's white portrait canvas.
         max_content = (
             OUTPUT_SIZE[0] - (MARGIN * 2),
             OUTPUT_SIZE[1] - (MARGIN * 2),
